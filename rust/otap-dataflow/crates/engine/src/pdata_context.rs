@@ -59,7 +59,9 @@ use otel_arrow_dfe_config::context::transport_policy::{
 use otel_arrow_dfe_config::engine::ResolvedOtelDataflowSpec;
 use otel_arrow_dfe_config::error::Error;
 use otel_arrow_dfe_config::node::{NodeKind, NodeUserConfig};
-use otel_arrow_dfe_config::{ContextEntryName, NodeId as ConfigNodeId, PipelineKey};
+use otel_arrow_dfe_config::{
+    ContextEntryName, ContextSelector, NodeId as ConfigNodeId, PipelineKey,
+};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
@@ -208,6 +210,42 @@ pub struct ContextEntrySelector {
     pub form: ContextEntrySelectorForm,
     /// Number of values the consumer takes from each selected member.
     pub take: ContextEntryTake,
+}
+
+impl ContextEntrySelector {
+    /// Lowers a configured selector into ordered entry reads.
+    ///
+    /// Domain primitives use the domain's stored-name matching: ASCII
+    /// case-insensitive for transport headers and exact for authorized
+    /// identity. Without a domain, unqualified names select whole composites
+    /// and qualified names select one composite member.
+    pub fn from_config(
+        selector: &ContextSelector,
+        form: ContextEntrySelectorForm,
+        take: ContextEntryTake,
+    ) -> impl Iterator<Item = Self> + '_ {
+        let domain = selector.domain();
+        selector.named().iter().map(move |reference| {
+            let target = match (domain, reference.scope()) {
+                (Some(domain), _) => ContextEntryTarget::Primitive {
+                    domain,
+                    name: reference.name().clone(),
+                    matching: match domain {
+                        ContextDomain::TransportHeader => ContextNameMatching::AsciiCaseInsensitive,
+                        ContextDomain::AuthorizedIdentity => ContextNameMatching::Exact,
+                    },
+                },
+                (None, Some(composite)) => ContextEntryTarget::CompositeMember {
+                    composite: composite.clone(),
+                    member: reference.name().clone(),
+                },
+                (None, None) => ContextEntryTarget::Composite {
+                    name: reference.name().clone(),
+                },
+            };
+            Self { target, form, take }
+        })
+    }
 }
 
 /// Specifies which already-stored values a consumer reads from each selected member.

@@ -64,7 +64,7 @@ use otel_arrow_dfe_engine::{
 use otel_arrow_dfe_otap::{
     OTAP_PROCESSOR_FACTORIES,
     opaque_string::OpaqueString,
-    pdata::{Context, OtapPdata, PdataEffectHandlerExtension},
+    pdata::{OtapPdata, PdataEffectHandlerExtension},
 };
 #[cfg(test)]
 use otel_arrow_dfe_pdata::TryIntoWithOptions;
@@ -91,7 +91,7 @@ mod plan;
 
 pub use enrichment::ConfiguredValue;
 pub use plan::{ActionSignal, ScopedAction};
-use plan::{CompiledTransform, signal_index};
+use plan::{CompiledTransform, SourceBindings, signal_index};
 
 /// URN for the AttributesProcessor
 pub const ATTRIBUTES_PROCESSOR_URN: &str = "urn:otel:processor:attribute";
@@ -260,10 +260,7 @@ impl AttributesProcessor {
         pipeline_ctx: PipelineContext,
         config: Config,
     ) -> Result<Self, otel_arrow_dfe_config::error::Error> {
-        let plans = compile_config(&config)?;
-        if !config.context_declarations().is_empty() {
-            config.validate_context_declarations(&pipeline_ctx)?;
-        }
+        let plans = bind_config(&config, &pipeline_ctx)?;
 
         let domains = parse_apply_to(config.apply_to.as_ref());
 
@@ -353,15 +350,36 @@ impl AttributesProcessor {
     }
 }
 
-fn compile_config(config: &Config) -> Result<[CompiledTransform; 3], ConfigError> {
+fn compile_config(
+    config: &Config,
+    bindings: SourceBindings<'_>,
+) -> Result<[CompiledTransform; 3], ConfigError> {
     for action in &config.actions {
         action.validate()?;
     }
     Ok([
-        CompiledTransform::new(&config.actions, SignalType::Logs)?,
-        CompiledTransform::new(&config.actions, SignalType::Metrics)?,
-        CompiledTransform::new(&config.actions, SignalType::Traces)?,
+        CompiledTransform::new(&config.actions, SignalType::Logs, bindings)?,
+        CompiledTransform::new(&config.actions, SignalType::Metrics, bindings)?,
+        CompiledTransform::new(&config.actions, SignalType::Traces, bindings)?,
     ])
+}
+
+/// Compiles actions and binds dynamic sources to this node's compiled context reads.
+///
+/// Declarations must equal those installed for the node, so live updates
+/// cannot introduce reads that were not compiled at pipeline construction.
+fn bind_config(
+    config: &Config,
+    pipeline_ctx: &PipelineContext,
+) -> Result<[CompiledTransform; 3], ConfigError> {
+    if config.context_declarations().is_empty() {
+        return compile_config(config, SourceBindings::ValidateOnly);
+    }
+    config.validate_context_declarations(pipeline_ctx)?;
+    let bindings = pipeline_ctx.node_bindings().ok_or_else(|| {
+        enrichment::invalid_config("attribute context sources require compiled node bindings")
+    })?;
+    compile_config(config, SourceBindings::Node(&bindings))
 }
 
 fn validate_config(value: &Value) -> Result<(), ConfigError> {
@@ -369,7 +387,7 @@ fn validate_config(value: &Value) -> Result<(), ConfigError> {
         serde_json::from_value(value.clone()).map_err(|error| ConfigError::InvalidUserConfig {
             error: error.to_string(),
         })?;
-    compile_config(&config).map(|_| ())
+    compile_config(&config, SourceBindings::ValidateOnly).map(|_| ())
 }
 
 #[async_trait(?Send)]
@@ -387,10 +405,7 @@ impl local::Processor<OtapPdata> for AttributesProcessor {
                             error: error.to_string(),
                         })
                         .and_then(|config| {
-                            let plans = compile_config(&config)?;
-                            if !config.context_declarations().is_empty() {
-                                config.validate_context_declarations(&self.pipeline_ctx)?;
-                            }
+                            let plans = bind_config(&config, &self.pipeline_ctx)?;
                             Ok((config, plans))
                         });
                     match replacement {
@@ -418,7 +433,7 @@ impl local::Processor<OtapPdata> for AttributesProcessor {
                 }
                 _ => Ok(()),
             },
-            Message::PData(mut pdata) => {
+            Message::PData(pdata) => {
                 let signal = pdata.signal_type();
                 if self.plans[signal_index(signal)].is_noop() {
                     return effect_handler
@@ -426,7 +441,7 @@ impl local::Processor<OtapPdata> for AttributesProcessor {
                         .await
                         .map_err(Into::into);
                 }
-                let resolved = self.plans[signal_index(signal)].resolve(pdata.context_mut());
+                let resolved = self.plans[signal_index(signal)].resolve(pdata.metadata());
                 let dynamic = match resolved {
                     Ok(dynamic) => dynamic,
                     Err(error) => {
