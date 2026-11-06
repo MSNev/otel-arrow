@@ -1,13 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use super::enrichment::AttributeSource;
-use super::enrichment::{context_entries, resolve_source, validate_source};
+use super::enrichment::{BoundSource, context_entries};
 use super::*;
 use otel_arrow_dfe_config::ContextEntryName;
-use otel_arrow_dfe_config::context::policy::{
-    ContextEntryDeclaration, ContextEntryDefinition, ContextEntryPart, ContextScope,
-};
 use otel_arrow_dfe_config::context::transport_headers::{
     TransportHeader, TransportHeaders, ValueKind,
 };
@@ -18,6 +14,7 @@ use otel_arrow_dfe_engine::control::{
 };
 use otel_arrow_dfe_engine::pdata_context::ContextMaterializationPlan;
 use otel_arrow_dfe_engine::testing::{node::test_node, processor::TestRuntime};
+use otel_arrow_dfe_otap::pdata::Context;
 use otel_arrow_dfe_pdata::OtlpProtoBytes;
 use otel_arrow_dfe_pdata::proto::opentelemetry::{
     collector::{
@@ -45,6 +42,7 @@ fn pipeline_context() -> PipelineContext {
     )
 }
 
+/// Binds a pipeline context for `config` whose policy declares placeholder composites.
 fn declared_pipeline_context(config: &Value) -> PipelineContext {
     use otel_arrow_dfe_engine::pdata_context::{
         ContextConsumerSelector, ContextDeclaration, ContextEntryTarget,
@@ -88,7 +86,12 @@ fn declared_pipeline_context(config: &Value) -> PipelineContext {
             )
         })
         .collect();
-    let prepared = prepare_context(config, json!(entries)).unwrap();
+    entries_pipeline_context(config, json!(entries))
+}
+
+/// Binds a pipeline context for `config` whose policy declares `entries`.
+fn entries_pipeline_context(config: &Value, entries: Value) -> PipelineContext {
+    let prepared = prepare_context(config, entries).unwrap();
     let mut ctx = pipeline_context().with_node_context(
         "attributes".into(),
         ATTRIBUTES_PROCESSOR_URN.into(),
@@ -124,6 +127,26 @@ fn prepare_context(
     factory.compile_initial_context(&spec.resolve())
 }
 
+/// Binds `source` through a pipeline whose policy declares `entries`, returning
+/// the pipeline's materialization plan for building matching contexts.
+fn bind_source(source: Value, entries: Value) -> (BoundSource, ContextMaterializationPlan) {
+    let config =
+        json!({"actions":[{"action":"insert","key":"x","value":{"source":source.clone()}}]});
+    let prepared = prepare_context(&config, entries).unwrap();
+    let pipeline = pipeline_context().pipeline_key();
+    let bindings = prepared
+        .bindings
+        .node_bindings(&pipeline, &"attributes".into())
+        .unwrap();
+    let bound = BoundSource::bind(&serde_json::from_value(source).unwrap(), bindings).unwrap();
+    let plan = prepared
+        .bindings
+        .context_materialization_plan(&pipeline)
+        .cloned()
+        .unwrap_or_default();
+    (bound, plan)
+}
+
 fn header_context(headers: &[(&str, ValueKind, &[u8])]) -> Context {
     let mut context = Context::default();
     let mut captured = TransportHeaders::new();
@@ -138,20 +161,38 @@ fn header_context(headers: &[(&str, ValueKind, &[u8])]) -> Context {
     context
 }
 
-fn store_context_text(context: &mut Context, name: &str, text: String) {
-    let plan = ContextMaterializationPlan::compile(&[ContextEntryDeclaration {
-        scope: ContextScope::Engine,
-        name: ContextEntryName::try_from(name).unwrap(),
-        definition: ContextEntryDefinition(vec![ContextEntryPart::Constant {
-            name: ContextEntryName::try_from("value").unwrap(),
-            value: text,
-        }]),
-    }])
-    .unwrap();
-    context.materialize_context(&plan);
+/// Returns the materialization plan compiled for a pipeline declaring `entries`.
+fn pipeline_plan(config: &Value, entries: Value) -> ContextMaterializationPlan {
+    prepare_context(config, entries)
+        .unwrap()
+        .bindings
+        .context_materialization_plan(&pipeline_context().pipeline_key())
+        .cloned()
+        .unwrap()
 }
 
 fn run(
+    config: Value,
+    messages: Vec<Message<OtapPdata>>,
+    check: impl FnOnce(Vec<OtapPdata>) + 'static,
+) {
+    let pipeline_ctx = declared_pipeline_context(&config);
+    run_in(pipeline_ctx, config, messages, check);
+}
+
+/// Runs the processor in a pipeline whose policy declares `entries`.
+fn run_with_entries(
+    config: Value,
+    entries: Value,
+    messages: Vec<Message<OtapPdata>>,
+    check: impl FnOnce(Vec<OtapPdata>) + 'static,
+) {
+    let pipeline_ctx = entries_pipeline_context(&config, entries);
+    run_in(pipeline_ctx, config, messages, check);
+}
+
+fn run_in(
+    pipeline_ctx: PipelineContext,
     config: Value,
     messages: Vec<Message<OtapPdata>>,
     check: impl FnOnce(Vec<OtapPdata>) + 'static,
@@ -160,7 +201,7 @@ fn run(
     let mut node_config = NodeUserConfig::new_processor_config(ATTRIBUTES_PROCESSOR_URN);
     node_config.config = config;
     let processor = create_attributes_processor(
-        declared_pipeline_context(&node_config.config),
+        pipeline_ctx,
         test_node("attribute-enrichment"),
         Arc::new(node_config),
         rt.config(),
@@ -323,19 +364,19 @@ fn rejects_invalid_enrichment_configuration() {
         json!({"action":"update","key":"x","value":{"from_context":"x","from_headers":["host"]}}),
         json!({"action":"insert","key":"x","value":{"source":{"type":"none"}}}),
         json!({"action":"insert","key":"x","value":{"source":{"type":"all_captured"}}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["entry:member"]}}}),
-        json!({"action":"upsert","key":"x","value":{"source":{"type":"transport_header","named":[]}}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":[""]}}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"named","named":[" "]}}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"named","named":["x"]},"transform":"unknown"}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"named","named":["x"]},"value_type":"int"}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"named","named":["x"]},"transform":null}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["host"]},"transform":"authority_host","selection":"middle"}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["host"]},"transform":"authority_host","selection":null}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["host"]},"selection":"first"}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"named","named":["x"]},"transform":"int","selection":"last"}}),
+        json!({"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["entry:member"]}}}),
+        json!({"action":"upsert","key":"x","value":{"source":{"domain":"transport_header","named":[]}}}),
+        json!({"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":[""]}}}),
+        json!({"action":"insert","key":"x","value":{"source":{"named":[" "]}}}),
+        json!({"action":"insert","key":"x","value":{"source":{"named":["x"]},"transform":"unknown"}}),
+        json!({"action":"insert","key":"x","value":{"source":{"named":["x"]},"value_type":"int"}}),
+        json!({"action":"insert","key":"x","value":{"source":{"named":["x"]},"transform":null}}),
+        json!({"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["host"]},"transform":"authority_host","selection":"middle"}}),
+        json!({"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["host"]},"transform":"authority_host","selection":null}}),
+        json!({"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["host"]},"selection":"first"}}),
+        json!({"action":"insert","key":"x","value":{"source":{"named":["x"]},"transform":"int","selection":"last"}}),
         json!({"action":"insert","key":"x","value":{"string":"host","selection":"last"}}),
-        json!({"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["host"]},"transform":"unknown"}}),
+        json!({"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["host"]},"transform":"unknown"}}),
         json!({"action":"insert","key":"x","value":1,"signals":[]}),
         json!({"action":"delete","key":"x","signals":["unknown"]}),
         json!({"action":"insert","key":"x","signals":null}),
@@ -460,7 +501,7 @@ fn documented_typed_literals_preserve_scalar_behavior() {
         }
     }
     for value in [
-        json!({"string":"prod","source":{"type":"transport_header","named":["host"]}}),
+        json!({"string":"prod","source":{"domain":"transport_header","named":["host"]}}),
         json!({"string":"prod","transform":"authority_host"}),
         json!({"string":"prod","int":1}),
         json!({"int":"1"}),
@@ -488,28 +529,20 @@ fn ordered_headers_skip_unusable_candidates() {
         ("preferred", ValueKind::Text, b"first.example:443"),
         ("preferred", ValueKind::Text, b"second.example:443"),
     ]);
-    let source: AttributeSource = serde_json::from_value(json!({
-        "type":"transport_header","named":["absent", "preferred", "host"]
-    }))
-    .unwrap();
-    assert_eq!(
-        resolve_source(&source, &context).unwrap(),
-        Some(LiteralValue::Str("first.example:443".into()))
-    );
-    let fallback: AttributeSource = serde_json::from_value(json!({
-        "type":"transport_header","named":["missing", "host"]
-    }))
-    .unwrap();
-    assert_eq!(
-        resolve_source(&fallback, &context).unwrap(),
-        Some(LiteralValue::Str("last.example:80".into()))
-    );
-    let text: AttributeSource =
-        serde_json::from_value(json!({"type":"transport_header","named":["host"]})).unwrap();
-    assert_eq!(
-        resolve_source(&text, &context).unwrap(),
-        Some(LiteralValue::Str("last.example:80".into()))
-    );
+    for (named, expected) in [
+        (json!(["absent", "preferred", "host"]), "first.example:443"),
+        (json!(["missing", "host"]), "last.example:80"),
+        (json!(["host"]), "last.example:80"),
+    ] {
+        let (source, _) = bind_source(
+            json!({"domain":"transport_header","named":named}),
+            json!({}),
+        );
+        assert_eq!(
+            source.resolve(context.metadata()).unwrap(),
+            Some(LiteralValue::Str(expected.into()))
+        );
+    }
 }
 
 /// Scenario: Header candidates and repeated captured names use different ASCII casing.
@@ -528,12 +561,12 @@ fn mixed_case_headers_preserve_candidate_and_capture_order() {
             (captured_name, ValueKind::Text, b"first.example:443"),
             (candidate_name, ValueKind::Text, b"second.example:443"),
         ]);
-        let source: AttributeSource = serde_json::from_value(json!({
-            "type":"transport_header","named":[candidate_name, "host"]
-        }))
-        .unwrap();
+        let (source, _) = bind_source(
+            json!({"domain":"transport_header","named":[candidate_name, "host"]}),
+            json!({}),
+        );
         assert_eq!(
-            resolve_source(&source, &context).unwrap(),
+            source.resolve(context.metadata()).unwrap(),
             Some(LiteralValue::Str("first.example:443".into()))
         );
     }
@@ -553,29 +586,25 @@ fn stored_header_text_otlp_otap_parity() {
                         .unwrap()
                         .into();
                 }
-                let mut context = header_context(&[("host", ValueKind::Text, text.as_bytes())]);
-                let plan = ContextMaterializationPlan::compile(&[ContextEntryDeclaration {
-                    scope: ContextScope::Engine,
-                    name: ContextEntryName::try_from("request").unwrap(),
-                    definition: ContextEntryDefinition(vec![ContextEntryPart::TransportHeader {
-                        name: ContextEntryName::try_from("host").unwrap(),
-                        store_as: Some(ContextEntryName::try_from("value").unwrap()),
-                    }]),
-                }])
-                .unwrap();
-                context.materialize_context(&plan);
-                let original_context = context.clone();
-                run(
-                    json!({
+                let entries = json!({"request":[
+                    {"type":"transport_header","name":"host","store_as":"value"}
+                ]});
+                let config = json!({
                         "apply_to":["resource","scope","signal"],
                         "actions":[
-                            {"action":"insert","key":"insert_new","value":{"source":{"type":"transport_header","named":["host"]}}},
-                            {"action":"insert","key":"insert_existing","value":{"source":{"type":"transport_header","named":["host"]}}},
-                            {"action":"upsert","key":"upsert_existing","value":{"source":{"type":"named","named":["request:value"]}}},
-                            {"action":"update","key":"update_existing","value":{"source":{"type":"transport_header","named":["host"]}}},
-                            {"action":"update","key":"update_missing","value":{"source":{"type":"named","named":["request:value"]}}}
+                            {"action":"insert","key":"insert_new","value":{"source":{"domain":"transport_header","named":["host"]}}},
+                            {"action":"insert","key":"insert_existing","value":{"source":{"domain":"transport_header","named":["host"]}}},
+                            {"action":"upsert","key":"upsert_existing","value":{"source":{"named":["request:value"]}}},
+                            {"action":"update","key":"update_existing","value":{"source":{"domain":"transport_header","named":["host"]}}},
+                            {"action":"update","key":"update_missing","value":{"source":{"named":["request:value"]}}}
                         ]
-                    }),
+                });
+                let mut context = header_context(&[("host", ValueKind::Text, text.as_bytes())]);
+                context.materialize_context(&pipeline_plan(&config, entries.clone()));
+                let original_context = context.clone();
+                run_with_entries(
+                    config,
+                    entries,
                     vec![Message::PData(OtapPdata::new(context, payload))],
                     move |mut output| {
                         assert_eq!(output.len(), 1);
@@ -702,33 +731,33 @@ fn static_dynamic_composition() {
     ] {
         assert!(
             validate_config(&json!({"actions":[
-                {"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["missing"]}}}, other
+                {"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["missing"]}}}, other
             ]}))
             .is_err()
         );
     }
     validate_config(&json!({"actions":[
-        {"action":"insert","key":"x","value":{"source":{"type":"named","named":["x"]}},"signals":["logs"]},
+        {"action":"insert","key":"x","value":{"source":{"named":["x"]}},"signals":["logs"]},
         {"action":"upsert","key":"x","value":1,"signals":["metrics","traces"]}
     ]}))
     .unwrap();
-    let config: Config = serde_json::from_value(json!({"actions":[
+    let value = json!({"actions":[
         {"action":"insert","key":"x","value":1},
-        {"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["missing"]}}}
-    ]}))
-    .unwrap();
-    let plans = compile_config(&config).unwrap();
+        {"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["missing"]}}}
+    ]});
+    let config: Config = serde_json::from_value(value.clone()).unwrap();
+    let plans = bind_config(&config, &declared_pipeline_context(&value)).unwrap();
     assert!(plan::is_noop(&plans[0].transform));
     assert!(plan::is_noop(
-        &plans[0].resolve(&Context::default()).unwrap()
+        &plans[0].resolve(Context::default().metadata()).unwrap()
     ));
-    let reversed: Config = serde_json::from_value(json!({"actions":[
-        {"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["missing"]}}},
+    let reversed = json!({"actions":[
+        {"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["missing"]}}},
         {"action":"insert","key":"x","value":1}
-    ]}))
-    .unwrap();
+    ]});
+    let config: Config = serde_json::from_value(reversed.clone()).unwrap();
     assert!(!plan::is_noop(
-        &compile_config(&reversed).unwrap()[0].transform
+        &bind_config(&config, &declared_pipeline_context(&reversed)).unwrap()[0].transform
     ));
 }
 
@@ -736,18 +765,19 @@ fn static_dynamic_composition() {
 /// Guarantees: Projection preserves the original text without interpreting, wrapping, or rejecting it.
 #[test]
 fn checked_context_attribute_range() {
-    let source: AttributeSource =
-        serde_json::from_value(json!({"type":"named","named":["received:value"]})).unwrap();
     for integer in [0, i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX] {
+        let (source, plan) = bind_source(
+            json!({"named":["received:value"]}),
+            json!({"received":[{"type":"constant","name":"value","value":integer.to_string()}]}),
+        );
         let mut context = Context::default();
-        store_context_text(&mut context, "received", integer.to_string());
+        context.materialize_context(&plan);
         assert_eq!(
-            resolve_source(&source, &context).unwrap(),
+            source.resolve(context.metadata()).unwrap(),
             Some(LiteralValue::Str(integer.to_string()))
         );
+        assert_eq!(source.resolve(Context::default().metadata()).unwrap(), None);
     }
-    let context = Context::default();
-    assert_eq!(resolve_source(&source, &context).unwrap(), None);
 }
 
 /// Scenario: Context text drives insert, upsert, and update for all signals and encodings.
@@ -780,21 +810,25 @@ fn typed_context_actions_otlp_otap_parity() {
                         .unwrap()
                         .into();
                 }
-                let mut context = Context::default();
-                store_context_text(&mut context, "scalar", text.clone());
-                let original_context = context.clone();
-                let expected = expected.clone();
-                run(
-                    json!({
+                let entries =
+                    json!({"scalar":[{"type":"constant","name":"value","value":text.clone()}]});
+                let config = json!({
                         "apply_to":["resource","scope","signal"],
                         "actions":[
-                            {"action":"insert","key":"insert_new","value":{"source":{"type":"named","named":["scalar:value"]}}},
-                            {"action":"insert","key":"insert_existing","value":{"source":{"type":"named","named":["scalar"]}}},
-                            {"action":"upsert","key":"upsert_existing","value":{"source":{"type":"named","named":["scalar"]}}},
-                            {"action":"update","key":"update_existing","value":{"source":{"type":"named","named":["scalar"]}}},
-                            {"action":"update","key":"update_missing","value":{"source":{"type":"named","named":["scalar"]}}}
+                            {"action":"insert","key":"insert_new","value":{"source":{"named":["scalar:value"]}}},
+                            {"action":"insert","key":"insert_existing","value":{"source":{"named":["scalar"]}}},
+                            {"action":"upsert","key":"upsert_existing","value":{"source":{"named":["scalar"]}}},
+                            {"action":"update","key":"update_existing","value":{"source":{"named":["scalar"]}}},
+                            {"action":"update","key":"update_missing","value":{"source":{"named":["scalar"]}}}
                         ]
-                    }),
+                });
+                let mut context = Context::default();
+                context.materialize_context(&pipeline_plan(&config, entries.clone()));
+                let original_context = context.clone();
+                let expected = expected.clone();
+                run_with_entries(
+                    config,
+                    entries,
                     vec![Message::PData(OtapPdata::new(context, payload))],
                     move |mut output| {
                         assert_eq!(output.len(), 1);
@@ -835,24 +869,27 @@ fn dynamic_actions_otlp_otap_signal_domain_parity() {
                         .unwrap()
                         .into();
                 }
-                let mut context = header_context(&[("host", ValueKind::Text, b"new.example:443")]);
-                store_context_text(&mut context, "received", "456".into());
+                let entries =
+                    json!({"received":[{"type":"constant","name":"value","value":"456"}]});
                 let config = json!({
                     "apply_to":[selected_domain],
                     "actions":[
                         {"action":"insert","key":"literal","value":true},
-                        {"action":"insert","key":"insert_existing","value":{"source":{"type":"transport_header","named":["host"]}}},
-                        {"action":"insert","key":"insert_new","value":{"source":{"type":"transport_header","named":["host"]}}},
-                        {"action":"upsert","key":"upsert_existing","value":{"source":{"type":"transport_header","named":["host"]}}},
-                        {"action":"update","key":"update_existing","value":{"source":{"type":"named","named":["received"]}}},
-                        {"action":"update","key":"update_missing","value":{"source":{"type":"named","named":["received"]}}},
-                        {"action":"insert","key":"missing","value":{"source":{"type":"transport_header","named":["uncaptured"]}}},
-                        {"action":"insert","key":"logs_only","value":{"source":{"type":"named","named":["received"]}},"signals":["logs"]},
+                        {"action":"insert","key":"insert_existing","value":{"source":{"domain":"transport_header","named":["host"]}}},
+                        {"action":"insert","key":"insert_new","value":{"source":{"domain":"transport_header","named":["host"]}}},
+                        {"action":"upsert","key":"upsert_existing","value":{"source":{"domain":"transport_header","named":["host"]}}},
+                        {"action":"update","key":"update_existing","value":{"source":{"named":["received"]}}},
+                        {"action":"update","key":"update_missing","value":{"source":{"named":["received"]}}},
+                        {"action":"insert","key":"missing","value":{"source":{"domain":"transport_header","named":["uncaptured"]}}},
+                        {"action":"insert","key":"logs_only","value":{"source":{"named":["received"]}},"signals":["logs"]},
                         {"action":"insert","key":"traces_only","value":true,"signals":["traces"]}
                     ]
                 });
-                run(
+                let mut context = header_context(&[("host", ValueKind::Text, b"new.example:443")]);
+                context.materialize_context(&pipeline_plan(&config, entries.clone()));
+                run_with_entries(
                     config,
+                    entries,
                     vec![Message::PData(OtapPdata::new(context, payload))],
                     move |mut output| {
                         assert_eq!(output.len(), 1);
@@ -917,8 +954,8 @@ fn attribute_actions_preserve_log_timestamps_and_context() {
         let original_context = context.clone();
         run(
             json!({"apply_to":["resource"],"actions":[
-                {"action":"insert","key":"server.address","value":{"source":{"type":"transport_header","named":["host"]}}},
-                {"action":"insert","key":"missing","value":{"source":{"type":"named","named":["missing"]}}}
+                {"action":"insert","key":"server.address","value":{"source":{"domain":"transport_header","named":["host"]}}},
+                {"action":"insert","key":"missing","value":{"source":{"named":["missing"]}}}
             ]}),
             vec![Message::PData(OtapPdata::new(context, payload))],
             move |mut output| {
@@ -958,8 +995,8 @@ fn attribute_actions_preserve_log_timestamps_and_context() {
 fn noop_retains_unconverted_payload() {
     for config in [
         json!({}),
-        json!({"actions":[{"action":"insert","key":"x","value":{"source":{"type":"named","named":["absent"]}}}]}),
-        json!({"actions":[{"action":"insert","key":"x","value":{"source":{"type":"transport_header","named":["host"]}}}]}),
+        json!({"actions":[{"action":"insert","key":"x","value":{"source":{"named":["absent"]}}}]}),
+        json!({"actions":[{"action":"insert","key":"x","value":{"source":{"domain":"transport_header","named":["host"]}}}]}),
         json!({"actions":[{"action":"insert","key":"x","value":1,"signals":["metrics"]}]}),
     ] {
         let bytes = bytes::Bytes::from_static(b"not valid protobuf");
@@ -994,7 +1031,7 @@ fn configuration_update_preserves_last_valid_plan() {
             }),
             Message::Control(NodeControlMsg::Config {
                 config: json!({"actions":[
-                    {"action":"insert","key":"invalid","value":{"source":{"type":"transport_header","named":[]}}}
+                    {"action":"insert","key":"invalid","value":{"source":{"domain":"transport_header","named":[]}}}
                 ]}),
             }),
             Message::PData(OtapPdata::new(
@@ -1020,7 +1057,7 @@ fn removed_source_transform_updates_are_rejected() {
     let config = |transform: &str| {
         json!({"actions":[
             {"action":"insert","key":"selected","value":{
-                "source":{"type":"transport_header","named":["host"]},"transform":transform
+                "source":{"domain":"transport_header","named":["host"]},"transform":transform
             }}
         ]})
     };
@@ -1032,7 +1069,7 @@ fn removed_source_transform_updates_are_rejected() {
     };
     run(
         json!({"actions":[{"action":"insert","key":"selected","value":{
-            "source":{"type":"transport_header","named":["host"]}
+            "source":{"domain":"transport_header","named":["host"]}
         }}]}),
         vec![
             pdata(),
@@ -1066,78 +1103,68 @@ fn removed_source_transform_updates_are_rejected() {
     );
 }
 
-/// Scenario: Context lookups encounter absent entries, absent members, ambiguous entries, and multi-valued headers.
-/// Guarantees: Missing values remain no-ops while nonscalar and ambiguous values produce explicit errors.
+/// Scenario: Context lookups encounter absent entries, ambiguous entries, and multi-valued or non-text members.
+/// Guarantees: Absent composites remain no-ops while nonscalar and ambiguous values produce explicit errors.
 #[test]
 fn context_lookup_shape_validation() {
-    let source = |name: &str| {
-        serde_json::from_value::<AttributeSource>(json!({
-            "type":"named","named":[name]
-        }))
-        .unwrap()
-    };
-    let mut context = Context::default();
-    assert_eq!(
-        resolve_source(&source("request:value"), &context).unwrap(),
-        None
-    );
-    store_context_text(&mut context, "request", "first.example,last.example".into());
-    assert_eq!(resolve_source(&source("absent"), &context).unwrap(), None);
-    assert_eq!(
-        resolve_source(&source("absent:value"), &context).unwrap(),
-        None
-    );
-    assert_eq!(
-        resolve_source(&source("request:absent"), &context).unwrap(),
-        None
-    );
-    assert_eq!(
-        resolve_source(&source("request"), &context).unwrap(),
-        Some(LiteralValue::Str("first.example,last.example".into()))
-    );
-    let plan = ContextMaterializationPlan::compile(&[ContextEntryDeclaration {
-        scope: ContextScope::Engine,
-        name: ContextEntryName::try_from("request").unwrap(),
-        definition: ContextEntryDefinition(vec![
-            ContextEntryPart::Constant {
-                name: ContextEntryName::try_from("first").unwrap(),
-                value: "first.example".into(),
-            },
-            ContextEntryPart::Constant {
-                name: ContextEntryName::try_from("last").unwrap(),
-                value: "last.example".into(),
-            },
-        ]),
-    }])
-    .unwrap();
+    let absent = json!([{"type":"transport_header","name":"missing"}]);
+    let scalar = json!({
+        "request":[{"type":"constant","name":"value","value":"first.example,last.example"}],
+        "absent":absent
+    });
+    for (reference, expected) in [
+        ("request:value", Some("first.example,last.example")),
+        ("request", Some("first.example,last.example")),
+        ("absent", None),
+        ("absent:missing", None),
+    ] {
+        let (source, plan) = bind_source(json!({"named":[reference]}), scalar.clone());
+        assert_eq!(
+            source.resolve(Context::default().metadata()).unwrap(),
+            None,
+            "{reference}"
+        );
+        let mut context = Context::default();
+        context.materialize_context(&plan);
+        assert_eq!(
+            source.resolve(context.metadata()).unwrap(),
+            expected.map(|text| LiteralValue::Str(text.into())),
+            "{reference}"
+        );
+    }
+
+    let multi = json!({"request":[
+        {"type":"constant","name":"first","value":"first.example"},
+        {"type":"constant","name":"last","value":"last.example"}
+    ]});
+    let (whole, plan) = bind_source(json!({"named":["request"]}), multi.clone());
     let mut context = Context::default();
     context.materialize_context(&plan);
     assert!(
-        resolve_source(&source("request"), &context)
+        whole
+            .resolve(context.metadata())
             .unwrap_err()
             .to_string()
             .contains("entry:member")
     );
+    let (member, _) = bind_source(json!({"named":["request:last"]}), multi);
     assert_eq!(
-        resolve_source(&source("request:last"), &context).unwrap(),
+        member.resolve(context.metadata()).unwrap(),
         Some(LiteralValue::Str("last.example".into()))
     );
-    let plan = ContextMaterializationPlan::compile(&[ContextEntryDeclaration {
-        scope: ContextScope::Engine,
-        name: ContextEntryName::try_from("request").unwrap(),
-        definition: ContextEntryDefinition(vec![ContextEntryPart::TransportHeader {
-            name: ContextEntryName::try_from("host").unwrap(),
-            store_as: None,
-        }]),
-    }])
-    .unwrap();
+
+    let (source, plan) = bind_source(
+        json!({"named":["request:host"]}),
+        json!({"request":[{"type":"transport_header","name":"host"}]}),
+    );
     let mut context = header_context(&[
         ("host", ValueKind::Text, b"first.example"),
         ("host", ValueKind::Text, b"last.example"),
     ]);
     context.materialize_context(&plan);
     assert!(
-        resolve_source(&source("request:host"), &context)
+        source
+            .resolve(context.metadata())
             .unwrap_err()
             .to_string()
             .contains("scalar")
@@ -1149,7 +1176,8 @@ fn context_lookup_shape_validation() {
         let mut context = header_context(&[("host", kind, bytes)]);
         context.materialize_context(&plan);
         assert!(
-            resolve_source(&source("request:host"), &context)
+            source
+                .resolve(context.metadata())
                 .unwrap_err()
                 .to_string()
                 .contains(reason)
@@ -1163,30 +1191,20 @@ fn context_lookup_shape_validation() {
 fn context_shape_error_permanently_nacks_original_message() {
     let rt = TestRuntime::new();
     let mut config = NodeUserConfig::new_processor_config(ATTRIBUTES_PROCESSOR_URN);
-    config.config = json!({"actions":[{"action":"insert","key":"received","value":{"source":{"type":"named","named":["received"]}}}]});
+    config.config = json!({"actions":[{"action":"insert","key":"received","value":{"source":{"named":["received"]}}}]});
+    let entries = json!({"received":[
+        {"type":"constant","name":"first","value":"one"},
+        {"type":"constant","name":"second","value":"two"}
+    ]});
+    let plan = pipeline_plan(&config.config, entries.clone());
     let processor = create_attributes_processor(
-        declared_pipeline_context(&config.config),
+        entries_pipeline_context(&config.config, entries),
         test_node("range-nack"),
         Arc::new(config),
         rt.config(),
     )
     .unwrap();
     let mut context = Context::default();
-    let plan = ContextMaterializationPlan::compile(&[ContextEntryDeclaration {
-        scope: ContextScope::Engine,
-        name: ContextEntryName::try_from("received").unwrap(),
-        definition: ContextEntryDefinition(vec![
-            ContextEntryPart::Constant {
-                name: ContextEntryName::try_from("first").unwrap(),
-                value: "one".into(),
-            },
-            ContextEntryPart::Constant {
-                name: ContextEntryName::try_from("second").unwrap(),
-                value: "two".into(),
-            },
-        ]),
-    }])
-    .unwrap();
     context.materialize_context(&plan);
     let original_context = context.clone();
     let input = OtapPdata::new(context, fixture(SignalType::Logs, &[0])).test_subscribe_to(
@@ -1310,7 +1328,7 @@ fn compute_duration_records_once_or_skips_noop() {
     for (config_value, expected_count) in [
         (json!({"actions":[]}), 0),
         (
-            json!({"actions":[{"action":"insert","key":"added","value":{"source":{"type":"transport_header","named":["missing"]}}}]}),
+            json!({"actions":[{"action":"insert","key":"added","value":{"source":{"domain":"transport_header","named":["missing"]}}}]}),
             0,
         ),
         (
@@ -1318,7 +1336,7 @@ fn compute_duration_records_once_or_skips_noop() {
             1,
         ),
         (
-            json!({"actions":[{"action":"insert","key":"added","value":{"source":{"type":"transport_header","named":["host"]}}}]}),
+            json!({"actions":[{"action":"insert","key":"added","value":{"source":{"domain":"transport_header","named":["host"]}}}]}),
             1,
         ),
     ] {
@@ -1328,7 +1346,7 @@ fn compute_duration_records_once_or_skips_noop() {
         )
         .unwrap();
         let context = header_context(&[("host", ValueKind::Text, b"example.test")]);
-        let dynamic = processor.plans[0].resolve(&context).unwrap();
+        let dynamic = processor.plans[0].resolve(context.metadata()).unwrap();
         let mut records = fixture(SignalType::Logs, &[0])
             .try_into_otap(&CodecService::new().unwrap())
             .unwrap();
@@ -1365,7 +1383,7 @@ fn compute_duration_records_once_or_skips_noop() {
 /// Guarantees: declarations materialize only selected composites, preserve fallback order, and reject unknown references.
 #[test]
 fn named_selector_declares_and_materializes_required_composites() {
-    let source = json!({"source":{"type":"named","named":["absent","request:number"]}});
+    let source = json!({"source":{"named":["absent","request:number"]}});
     let config = json!({"actions":[{"action":"insert","key":"sequence","value":source}]});
     let entries = json!({
         "absent":[{"type":"transport_header","name":"missing"}],
@@ -1399,13 +1417,14 @@ fn named_selector_declares_and_materializes_required_composites() {
             .entry(&ContextEntryName::try_from("unselected").unwrap())
             .is_none()
     );
-    let selected: AttributeSource = serde_json::from_value(source["source"].clone()).unwrap();
+    let (selected, _) = bind_source(source["source"].clone(), entries.clone());
     assert_eq!(
-        resolve_source(&selected, &context).unwrap(),
+        selected.resolve(context.metadata()).unwrap(),
         Some(LiteralValue::Str("42".into()))
     );
-    run(
+    run_with_entries(
         config,
+        entries.clone(),
         vec![Message::PData(OtapPdata::new(
             context,
             fixture(SignalType::Logs, &[0]),
@@ -1418,7 +1437,7 @@ fn named_selector_declares_and_materializes_required_composites() {
         },
     );
     for reference in ["unknown", "request:unknown"] {
-        let config = json!({"actions":[{"action":"insert","key":"x","value":{"source":{"type":"named","named":[reference]}}}]});
+        let config = json!({"actions":[{"action":"insert","key":"x","value":{"source":{"named":[reference]}}}]});
         assert!(prepare_context(&config, entries.clone()).is_err());
     }
 }
@@ -1448,25 +1467,25 @@ fn authorized_identity_selector_reads_only_captured_scalar_claims() {
             Some(LiteralValue::Str("42".into())),
         ),
     ] {
-        let source: AttributeSource = serde_json::from_value(json!({
-            "type":"authorized_identity","named":names
-        }))
-        .unwrap();
-        validate_source(&source).unwrap();
-        assert_eq!(resolve_source(&source, &context).unwrap(), expected);
+        let (source, _) = bind_source(
+            json!({"domain":"authorized_identity","named":names}),
+            json!({}),
+        );
+        assert_eq!(source.resolve(context.metadata()).unwrap(), expected);
     }
-    let groups: AttributeSource = serde_json::from_value(json!({
-        "type":"authorized_identity","named":["groups","UserId"]
-    }))
-    .unwrap();
+    let (groups, _) = bind_source(
+        json!({"domain":"authorized_identity","named":["groups","UserId"]}),
+        json!({}),
+    );
     assert!(
-        resolve_source(&groups, &context)
+        groups
+            .resolve(context.metadata())
             .unwrap_err()
             .to_string()
             .contains("scalar")
     );
     let config = json!({"actions":[{"action":"insert","key":"user.id","value":{
-        "source":{"type":"authorized_identity","named":["missing","UserId"]}
+        "source":{"domain":"authorized_identity","named":["missing","UserId"]}
     }}]});
     run(
         config,
@@ -1488,9 +1507,9 @@ fn selector_declarations_and_live_update_binding_validation() {
         ContextDomain, ContextEntrySelectorForm, ContextEntryTake, ContextEntryTarget,
         ContextNameMatching,
     };
-    for (kind, expected) in [
+    for (source, expected) in [
         (
-            "transport_header",
+            json!({"domain":"transport_header","named":["x"]}),
             ContextEntryTarget::Primitive {
                 domain: ContextDomain::TransportHeader,
                 name: ContextEntryName::try_from("x").unwrap(),
@@ -1498,7 +1517,7 @@ fn selector_declarations_and_live_update_binding_validation() {
             },
         ),
         (
-            "authorized_identity",
+            json!({"domain":"authorized_identity","named":["x"]}),
             ContextEntryTarget::Primitive {
                 domain: ContextDomain::AuthorizedIdentity,
                 name: ContextEntryName::try_from("x").unwrap(),
@@ -1506,14 +1525,20 @@ fn selector_declarations_and_live_update_binding_validation() {
             },
         ),
         (
-            "named",
+            json!({"named":["x"]}),
             ContextEntryTarget::Composite {
                 name: ContextEntryName::try_from("x").unwrap(),
             },
         ),
+        (
+            json!({"named":["x:y"]}),
+            ContextEntryTarget::CompositeMember {
+                composite: ContextEntryName::try_from("x").unwrap(),
+                member: ContextEntryName::try_from("y").unwrap(),
+            },
+        ),
     ] {
-        let source: AttributeSource =
-            serde_json::from_value(json!({"type":kind,"named":["x"]})).unwrap();
+        let source = serde_json::from_value(source).unwrap();
         let entries: Vec<_> = context_entries(&source).collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].target, expected);
@@ -1522,7 +1547,7 @@ fn selector_declarations_and_live_update_binding_validation() {
     }
     let config = |name| {
         json!({"actions":[{"action":"insert","key":"selected","value":{
-            "source":{"type":"transport_header","named":[name]}
+            "source":{"domain":"transport_header","named":[name]}
         }}]})
     };
     assert!(AttributesProcessor::from_config(pipeline_context(), &config("host")).is_err());
@@ -1558,7 +1583,7 @@ fn context_declarations_follow_effective_value_actions() {
         ("upsert", "upsert_existing"),
         ("update", "update_existing"),
     ] {
-        let source = json!({"source":{"type":"named","named":["request"]}});
+        let source = json!({"source":{"named":["request"]}});
         let config = json!({"actions":[
             {"action":operation,"key":key,"value":source},
             {"action":operation,"key":key,"value":"literal"}
@@ -1598,21 +1623,14 @@ fn context_declarations_follow_effective_value_actions() {
             {"action":operation,"key":key,"value":"literal","signals":["logs"]}
         ]});
         assert!(prepare_context(&partial, json!({})).is_err());
-        let prepared = prepare_context(
-            &partial,
-            json!({"request":[{"type":"constant","name":"value","value":"context"}]}),
-        )
-        .unwrap();
-        let pipeline = pipeline_context().pipeline_key();
-        let plan = prepared
-            .bindings
-            .context_materialization_plan(&pipeline)
-            .unwrap();
+        let entries = json!({"request":[{"type":"constant","name":"value","value":"context"}]});
+        let plan = pipeline_plan(&partial, entries.clone());
         for signal in [SignalType::Logs, SignalType::Metrics, SignalType::Traces] {
             let mut context = Context::default();
-            context.materialize_context(plan);
-            run(
+            context.materialize_context(&plan);
+            run_with_entries(
                 partial.clone(),
+                entries.clone(),
                 vec![Message::PData(OtapPdata::new(
                     context,
                     fixture(signal, &[0]),
@@ -1639,15 +1657,15 @@ fn context_declarations_follow_effective_value_actions() {
 fn live_update_preserves_bindings_when_candidate_order_and_grouping_change() {
     let initial = json!({"actions":[
         {"action":"insert","key":"first","value":{
-            "source":{"type":"transport_header","named":["forwarded","host"]}}},
+            "source":{"domain":"transport_header","named":["forwarded","host"]}}},
         {"action":"insert","key":"second","value":{
-            "source":{"type":"transport_header","named":["host"]}}}
+            "source":{"domain":"transport_header","named":["host"]}}}
     ]});
     let updated = json!({"actions":[
         {"action":"insert","key":"first","value":{
-            "source":{"type":"transport_header","named":["host","forwarded","host"]}}},
+            "source":{"domain":"transport_header","named":["host","forwarded","host"]}}},
         {"action":"insert","key":"second","value":{
-            "source":{"type":"transport_header","named":["forwarded","host"]}}}
+            "source":{"domain":"transport_header","named":["forwarded","host"]}}}
     ]});
     let parsed_initial: Config = serde_json::from_value(initial.clone()).unwrap();
     let parsed_updated: Config = serde_json::from_value(updated.clone()).unwrap();

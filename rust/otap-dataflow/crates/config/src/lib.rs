@@ -49,7 +49,7 @@ pub use topic::{
 };
 pub mod validation;
 
-pub use context::{ContextEntryName, ContextEntryRef};
+pub use context::{ContextEntryName, ContextEntryRef, ContextSelector};
 pub use conversion::ConversionOptions;
 
 /// Signal types

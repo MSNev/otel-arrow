@@ -93,16 +93,19 @@ Unsupported action variants are accepted for forward compatibility and ignored.
 - `value`: a literal (string, boolean, signed integer, or double). Scalar syntax
   remains supported; explicit typed objects use `string`, `bool`, `int`, or
   `double`, for example `value: { string: prod }`.
-- a dynamic object nested under `value`, containing a processor-local `source` selector
-  with a `type` and a nonempty ordered `named` list:
-  - `transport_header`: captured/stored header names.
-  - `named`: materialized composite names or qualified `entry:member`
+- a dynamic object nested under `value`, containing a shared context `source`
+  selector with an optional `domain` and a nonempty ordered `named` list:
+  - `domain: transport_header`: captured/stored header names, matched
+    ASCII case-insensitively.
+  - `domain: authorized_identity`: captured claim aliases, matched exactly.
+  - no `domain`: materialized composite names or qualified `entry:member`
     references. A bare composite name requires exactly one member.
-  Primitive selectors do not accept qualified references. `all_captured` and
-  `none` are not attribute value sources. The former `from_headers` and
-  `from_context` fields are not supported.
+  Domain selectors do not accept qualified references. The former
+  `from_headers` and `from_context` fields are not supported.
 
-The processor declares its selected context reads to the engine. Referenced
+The processor declares its selected context reads to the engine and binds
+each candidate to a compiled read when it is constructed, so messages are
+not scanned by name at runtime. Referenced
 composites and members must exist in the pipeline's context policy; the engine
 selects only the required composite snapshots for materialization. Unknown
 composites or members are configuration errors. Declarations do not broaden
@@ -146,13 +149,12 @@ actions:
     key: server.address
     value:
       source:
-        type: transport_header
+        domain: transport_header
         named: [x-forwarded-host, x-azure-originalhost, host]
   - action: insert
     key: request.sequence
     value:
       source:
-        type: named
         named: [request_sequence]
 ```
 
@@ -197,19 +199,18 @@ config:
       key: server.address
       value:
         source:
-          type: transport_header
+          domain: transport_header
           named: [x-forwarded-host, x-azure-originalhost, host]
     - action: insert
       key: http.host
       value:
         source:
-          type: transport_header
+          domain: transport_header
           named: [x-forwarded-host, x-azure-originalhost, host]
     - action: insert
       key: request.sequence
       value:
         source:
-          type: named
           named: [request_sequence]
       signals: [logs]
 ```

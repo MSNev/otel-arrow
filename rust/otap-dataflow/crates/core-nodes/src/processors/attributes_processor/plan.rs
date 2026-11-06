@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::*;
-use enrichment::invalid_config;
+use enrichment::{BoundSource, invalid_config};
+use otel_arrow_dfe_engine::pdata_context::NodeBindings;
 
 /// One action with an optional telemetry-signal filter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,12 +37,7 @@ impl ScopedAction {
         if self.signals.as_ref().is_some_and(Vec::is_empty) {
             return Err(invalid_config("signals cannot be empty"));
         }
-        match &self.action {
-            Action::Insert { value, .. }
-            | Action::Upsert { value, .. }
-            | Action::Update { value, .. } => value.validate(),
-            _ => Ok(()),
-        }
+        Ok(())
     }
 
     fn applies(&self, signal: SignalType) -> bool {
@@ -97,7 +93,16 @@ pub(super) fn effective_value_actions(
 struct DynamicAction {
     operation: Operation,
     key: String,
-    source: enrichment::AttributeSource,
+    source: BoundSource,
+}
+
+/// How dynamic sources are treated while compiling actions.
+#[derive(Clone, Copy)]
+pub(super) enum SourceBindings<'a> {
+    /// Factory validation without a pipeline; dynamic sources are not retained.
+    ValidateOnly,
+    /// Construction or reconfiguration; dynamic sources bind to compiled node reads.
+    Node(&'a NodeBindings),
 }
 
 pub(super) struct CompiledTransform {
@@ -132,7 +137,11 @@ impl CompiledTransform {
         is_noop(&self.transform) && self.dynamic.is_empty()
     }
 
-    pub(super) fn new(actions: &[ScopedAction], signal: SignalType) -> Result<Self, ConfigError> {
+    pub(super) fn new(
+        actions: &[ScopedAction],
+        signal: SignalType,
+        bindings: SourceBindings<'_>,
+    ) -> Result<Self, ConfigError> {
         let mut renames = BTreeMap::new();
         let mut deletes = BTreeSet::new();
         let mut inserts = BTreeMap::new();
@@ -191,28 +200,32 @@ impl CompiledTransform {
         })?;
 
         let mut dynamic = Vec::new();
-        let mut split = |sources: BTreeMap<String, ConfiguredValue>, operation| {
-            sources
-                .into_iter()
-                .filter_map(|(key, value)| match value {
+        let mut split = |sources: BTreeMap<String, ConfiguredValue>,
+                         operation|
+         -> Result<BTreeMap<String, LiteralValue>, ConfigError> {
+            let mut literals = BTreeMap::new();
+            for (key, value) in sources {
+                match value {
                     ConfiguredValue::Literal(value) | ConfiguredValue::Typed(value) => {
-                        Some((key, value))
+                        _ = literals.insert(key, value);
                     }
                     ConfiguredValue::Dynamic { source } => {
-                        dynamic.push(DynamicAction {
-                            operation,
-                            key,
-                            source,
-                        });
-                        None
+                        if let SourceBindings::Node(bindings) = bindings {
+                            dynamic.push(DynamicAction {
+                                operation,
+                                key,
+                                source: BoundSource::bind(&source, bindings)?,
+                            });
+                        }
                     }
-                })
-                .collect()
+                }
+            }
+            Ok(literals)
         };
         let values = values_transform(
-            split(inserts, Operation::Insert),
-            split(upserts, Operation::Upsert),
-            split(updates, Operation::Update),
+            split(inserts, Operation::Insert)?,
+            split(upserts, Operation::Upsert)?,
+            split(updates, Operation::Update)?,
         );
         transform.insert = values.insert;
         transform.upsert = values.upsert;
@@ -220,12 +233,15 @@ impl CompiledTransform {
         Ok(Self { transform, dynamic })
     }
 
-    pub(super) fn resolve(&self, context: &Context) -> Result<AttributesTransform, EngineError> {
+    pub(super) fn resolve(
+        &self,
+        metadata: &otel_arrow_dfe_engine::pdata_context::Metadata,
+    ) -> Result<AttributesTransform, EngineError> {
         let mut inserts = BTreeMap::new();
         let mut upserts = BTreeMap::new();
         let mut updates = BTreeMap::new();
         for action in &self.dynamic {
-            if let Some(value) = enrichment::resolve_source(&action.source, context)? {
+            if let Some(value) = action.source.resolve(metadata)? {
                 let destination = match action.operation {
                     Operation::Insert => &mut inserts,
                     Operation::Upsert => &mut upserts,

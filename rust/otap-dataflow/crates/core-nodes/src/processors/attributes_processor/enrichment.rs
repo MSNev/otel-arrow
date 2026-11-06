@@ -1,10 +1,10 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
-use otel_arrow_dfe_config::context::transport_headers::ValueKind;
+use otel_arrow_dfe_config::ContextSelector;
 use otel_arrow_dfe_engine::pdata_context::{
     ContextDomain, ContextEntrySelector, ContextEntrySelectorForm, ContextEntryTake,
-    ContextEntryTarget, ContextNameMatching, ContextValueCardinality, ContextValueKind,
+    ContextValueCardinality, ContextValueKind, Metadata, NodeBindings, Read, ReadMember, ValueRead,
 };
 
 use super::*;
@@ -19,32 +19,9 @@ pub enum ConfiguredValue {
     Typed(#[serde(with = "TypedLiteralSerde")] LiteralValue),
     /// Dynamic request metadata source, configured under the `value` key.
     Dynamic {
-        /// Ordered primitive names or composite references.
-        source: AttributeSource,
+        /// Ordered fallback primitives in one domain, or composite references.
+        source: ContextSelector,
     },
-}
-
-/// Processor-local selection of captured primitives or materialized context.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct AttributeSource {
-    /// Context domain to read without changing receiver capture policy.
-    #[serde(rename = "type")]
-    pub source_type: AttributeSourceType,
-    /// Ordered fallback candidates.
-    pub named: Vec<otel_arrow_dfe_config::ContextEntryRef>,
-}
-
-/// Context domains supported by attribute value projection.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum AttributeSourceType {
-    /// Captured transport-header values.
-    TransportHeader,
-    /// Captured verified identity claims.
-    AuthorizedIdentity,
-    /// Materialized composites or qualified members.
-    Named,
 }
 
 // Adapt the documented tagged syntax without introducing a second value representation.
@@ -78,160 +55,112 @@ pub(super) fn invalid_data(error: impl Into<String>) -> EngineError {
     }
 }
 
-pub(super) fn validate_source(source: &AttributeSource) -> Result<(), ConfigError> {
-    if source.named.is_empty() {
-        return Err(invalid_config(
-            "attribute source named list must not be empty",
-        ));
-    }
-    if source.source_type != AttributeSourceType::Named
-        && source.named.iter().any(|name| name.scope().is_some())
-    {
-        return Err(invalid_config(
-            "primitive attribute sources do not accept qualified names",
-        ));
-    }
-    Ok(())
-}
-
+/// Declares one value read per candidate, in fallback order.
 pub(super) fn context_entries(
-    source: &AttributeSource,
+    source: &ContextSelector,
 ) -> impl Iterator<Item = ContextEntrySelector> + '_ {
-    source.named.iter().map(|reference| {
-        let target = match source.source_type {
-            AttributeSourceType::TransportHeader | AttributeSourceType::AuthorizedIdentity => {
-                ContextEntryTarget::Primitive {
-                    domain: if source.source_type == AttributeSourceType::TransportHeader {
-                        ContextDomain::TransportHeader
-                    } else {
-                        ContextDomain::AuthorizedIdentity
-                    },
-                    name: reference.name().clone(),
-                    matching: if source.source_type == AttributeSourceType::TransportHeader {
-                        ContextNameMatching::AsciiCaseInsensitive
-                    } else {
-                        ContextNameMatching::Exact
-                    },
-                }
-            }
-            _ => match reference.scope() {
-                Some(composite) => ContextEntryTarget::CompositeMember {
-                    composite: composite.clone(),
-                    member: reference.name().clone(),
-                },
-                None => ContextEntryTarget::Composite {
-                    name: reference.name().clone(),
-                },
-            },
-        };
-        ContextEntrySelector {
-            target,
-            form: ContextEntrySelectorForm::Value,
-            take: ContextEntryTake::All,
-        }
-    })
+    ContextEntrySelector::from_config(
+        source,
+        ContextEntrySelectorForm::Value,
+        ContextEntryTake::All,
+    )
 }
 
-pub(super) fn resolve_source(
-    source: &AttributeSource,
-    context: &Context,
-) -> Result<Option<LiteralValue>, EngineError> {
-    let names = &source.named;
-    if source.source_type == AttributeSourceType::TransportHeader {
-        return Ok(context.transport_headers().and_then(|headers| {
-            names.iter().find_map(|name| {
-                headers
-                    .iter()
-                    .filter(|header| {
-                        header
-                            .name
-                            .as_str()
-                            .eq_ignore_ascii_case(name.name().as_str())
-                    })
-                    .find_map(|header| {
-                        if header.value.value_kind != ValueKind::Text {
-                            return None;
-                        }
-                        let text = header.value_as_str()?;
-                        if text.trim().is_empty() {
-                            return None;
-                        }
-                        Some(LiteralValue::Str(text.to_owned()))
-                    })
-            })
-        }));
+/// A dynamic source bound to the node's compiled reads at construction.
+#[derive(Debug, Clone)]
+pub(super) struct BoundSource {
+    domain: Option<ContextDomain>,
+    reads: Box<[ValueRead]>,
+}
+
+impl BoundSource {
+    /// Looks up the compiled read for every declared candidate.
+    pub(super) fn bind(
+        source: &ContextSelector,
+        bindings: &NodeBindings,
+    ) -> Result<Self, ConfigError> {
+        Ok(Self {
+            domain: source.domain(),
+            reads: context_entries(source)
+                .map(|selector| bindings.value(&selector).cloned())
+                .collect::<Result<_, _>>()?,
+        })
     }
-    for reference in names {
-        let value = if source.source_type == AttributeSourceType::AuthorizedIdentity {
-            let Some(entry) = context
-                .authorized_identity_entries()
-                .and_then(|entries| entries.get(reference.name().as_str()))
+
+    /// Returns the first usable candidate as text.
+    ///
+    /// Transport headers skip binary, invalid UTF-8, and blank values and fall
+    /// through to later candidates. Identity claims and composite members must
+    /// be scalar text; other shapes are errors.
+    pub(super) fn resolve(&self, metadata: &Metadata) -> Result<Option<LiteralValue>, EngineError> {
+        for read in &self.reads {
+            let Some(selected) = read
+                .read(metadata)
+                .map_err(|error| invalid_data(error.to_string()))?
             else {
                 continue;
             };
-            let text = entry.value().as_str().ok_or_else(|| {
-                invalid_data("authorized_identity requires a scalar context entry")
-            })?;
-            Some(LiteralValue::Str(text.to_owned()))
-        } else {
-            resolve_composite(context, reference)?
-        };
-        if value.is_some() {
-            return Ok(value);
+            let text = match self.domain {
+                Some(ContextDomain::TransportHeader) => first_usable_header(selected),
+                Some(ContextDomain::AuthorizedIdentity) => Some(scalar_text(selected, false)?),
+                None => Some(scalar_text(selected, true)?),
+            };
+            if let Some(text) = text {
+                return Ok(Some(LiteralValue::Str(text)));
+            }
         }
+        Ok(None)
     }
-    Ok(None)
 }
 
-fn resolve_composite(
-    context: &Context,
-    reference: &otel_arrow_dfe_config::ContextEntryRef,
-) -> Result<Option<LiteralValue>, EngineError> {
-    let Some(materialized) = context.materialized_context() else {
-        return Ok(None);
-    };
-    let member = if let Some(scope) = reference.scope() {
-        materialized
-            .entry(scope)
-            .and_then(|entry| entry.member(reference.name()))
-    } else {
-        match materialized.entry(reference.name()) {
-            Some(entry) => match entry.members() {
-                [member] => Some(member),
-                _ => {
-                    return Err(invalid_data(
-                        "named source requires entry:member for multi-member entries",
-                    ));
-                }
-            },
-            None => None,
+/// Selects the first non-blank text value among one header's captured values.
+fn first_usable_header(selected: Read<'_>) -> Option<String> {
+    let mut found = None;
+    selected.visit_members(|member| {
+        if found.is_some() {
+            return;
         }
-    };
-    let Some(member) = member else {
-        return Ok(None);
-    };
-    let values = member.values();
-    if values.cardinality() != ContextValueCardinality::One {
-        return Err(invalid_data(
-            "named source requires a scalar context member",
-        ));
-    }
-    let value = &values.values()[0];
-    if value.kind() != ContextValueKind::Text {
-        return Err(invalid_data(
-            "named source requires text for scalar attributes",
-        ));
-    }
-    let text = value
-        .as_str()
-        .ok_or_else(|| invalid_data("named source contains invalid UTF-8"))?;
-    Ok(Some(LiteralValue::Str(text.to_owned())))
+        found = member.values().find_map(|value| {
+            if value.kind != ContextValueKind::Text {
+                return None;
+            }
+            let text = std::str::from_utf8(value.bytes).ok()?;
+            (!text.trim().is_empty()).then(|| text.to_owned())
+        });
+    });
+    found
 }
-impl ConfiguredValue {
-    pub(super) fn validate(&self) -> Result<(), ConfigError> {
-        match self {
-            Self::Literal(_) | Self::Typed(_) => Ok(()),
-            Self::Dynamic { source } => validate_source(source),
+
+/// Requires one scalar text member; composites must select exactly one member.
+fn scalar_text(selected: Read<'_>, composite: bool) -> Result<String, EngineError> {
+    let mut first: Option<ReadMember<'_>> = None;
+    let mut members = 0usize;
+    selected.visit_members(|member| {
+        members += 1;
+        if first.is_none() {
+            first = Some(member);
         }
+    });
+    if composite && members > 1 {
+        return Err(invalid_data(
+            "context source requires entry:member for multi-member entries",
+        ));
     }
+    let Some(member) = first else {
+        return Err(invalid_data("context source selected no members"));
+    };
+    if member.cardinality != ContextValueCardinality::One {
+        return Err(invalid_data("context source requires a scalar value"));
+    }
+    let Some(value) = member.values().next() else {
+        return Err(invalid_data("context source requires a scalar value"));
+    };
+    if value.kind != ContextValueKind::Text {
+        return Err(invalid_data(
+            "context source requires text for scalar attributes",
+        ));
+    }
+    std::str::from_utf8(value.bytes)
+        .map(str::to_owned)
+        .map_err(|_| invalid_data("context source contains invalid UTF-8"))
 }

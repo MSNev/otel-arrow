@@ -3,8 +3,8 @@
 
 //! Context configuration.
 //!
-//! This module defines context entry names. Its submodules hold the rest of
-//! the configured context model:
+//! This module defines context entry names, references, and selectors. Its
+//! submodules hold the rest of the configured context model:
 //!
 //! - [`policy`]: scoped composite context definitions.
 //! - [`authorized_identity`]: authorized identity claim capture.
@@ -186,6 +186,95 @@ impl From<ContextEntryRef> for String {
     }
 }
 
+/// An ordered list of context entry references with an optional source domain.
+///
+/// With a `domain`, every name is an unqualified primitive stored in that
+/// domain. Without one, an unqualified name selects a whole composite entry
+/// and a qualified `composite:member` name selects one member, whose domain
+/// is defined by the composite.
+///
+/// ```yaml
+/// domain: transport_header
+/// named: [x-forwarded-host, host]
+/// ```
+#[derive(
+    Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord, Hash,
+)]
+#[serde(try_from = "ContextSelectorFields", into = "ContextSelectorFields")]
+#[schemars(with = "ContextSelectorFields")]
+pub struct ContextSelector {
+    domain: Option<policy::ContextDomain>,
+    named: Box<[ContextEntryRef]>,
+}
+
+/// Serialized form of [`ContextSelector`], validated on conversion.
+#[derive(Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ContextSelectorFields {
+    /// Source domain of unqualified primitive names. Omit to select composite
+    /// entries or `composite:member` references.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain: Option<policy::ContextDomain>,
+    /// Ordered, non-empty entry references.
+    named: Vec<ContextEntryRef>,
+}
+
+impl ContextSelector {
+    /// Creates a selector, rejecting an empty list and qualified names within a domain.
+    pub fn new(
+        domain: Option<policy::ContextDomain>,
+        named: Vec<ContextEntryRef>,
+    ) -> Result<Self, Error> {
+        if named.is_empty() {
+            return Err(Error::InvalidUserConfig {
+                error: "context selector `named` list must not be empty".into(),
+            });
+        }
+        if let Some(domain) = domain
+            && let Some(qualified) = named.iter().find(|name| name.scope().is_some())
+        {
+            return Err(Error::InvalidUserConfig {
+                error: format!(
+                    "context selector with domain {domain:?} does not accept qualified name `{qualified}`"
+                ),
+            });
+        }
+        Ok(Self {
+            domain,
+            named: named.into_boxed_slice(),
+        })
+    }
+
+    /// Returns the primitive source domain, or `None` for composite references.
+    #[must_use]
+    pub fn domain(&self) -> Option<policy::ContextDomain> {
+        self.domain
+    }
+
+    /// Returns the ordered references.
+    #[must_use]
+    pub fn named(&self) -> &[ContextEntryRef] {
+        &self.named
+    }
+}
+
+impl TryFrom<ContextSelectorFields> for ContextSelector {
+    type Error = Error;
+
+    fn try_from(fields: ContextSelectorFields) -> Result<Self, Self::Error> {
+        Self::new(fields.domain, fields.named)
+    }
+}
+
+impl From<ContextSelector> for ContextSelectorFields {
+    fn from(selector: ContextSelector) -> Self {
+        Self {
+            domain: selector.domain,
+            named: selector.named.into_vec(),
+        }
+    }
+}
+
 impl PartialEq<str> for ContextEntryName {
     fn eq(&self, other: &str) -> bool {
         self.as_str() == other
@@ -311,6 +400,55 @@ mod tests {
             assert!(
                 ContextEntryRef::try_from(configured).is_err(),
                 "{configured:?}"
+            );
+        }
+    }
+
+    /// Scenario: context selectors are configured with and without a domain, and in invalid shapes.
+    /// Guarantees: domain primitives and composite references parse in order and round-trip;
+    /// empty lists, qualified names within a domain, and unknown fields are rejected.
+    #[test]
+    fn context_selector_validates_domain_and_names() {
+        let primitive: ContextSelector =
+            serde_yaml::from_str("domain: transport_header\nnamed: [x-forwarded-host, host]")
+                .expect("domain selector");
+        assert_eq!(
+            primitive.domain(),
+            Some(policy::ContextDomain::TransportHeader)
+        );
+        assert_eq!(
+            primitive
+                .named()
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            ["x-forwarded-host", "host"]
+        );
+        let composite: ContextSelector =
+            serde_yaml::from_str("named: [request, 'request:host']").expect("composite selector");
+        assert_eq!(composite.domain(), None);
+        assert_eq!(
+            composite.named()[1].scope().map(|s| s.as_str()),
+            Some("request")
+        );
+        for selector in [primitive, composite] {
+            let round_trip: ContextSelector =
+                serde_json::from_value(serde_json::to_value(&selector).expect("serialize"))
+                    .expect("deserialize");
+            assert_eq!(round_trip, selector);
+        }
+
+        for invalid in [
+            "named: []",
+            "domain: transport_header\nnamed: ['request:host']",
+            "domain: authorized_identity\nnamed: ['request:host']",
+            "domain: unknown\nnamed: [host]",
+            "type: transport_header\nnamed: [host]",
+            "domain: transport_header",
+        ] {
+            assert!(
+                serde_yaml::from_str::<ContextSelector>(invalid).is_err(),
+                "{invalid:?}"
             );
         }
     }
