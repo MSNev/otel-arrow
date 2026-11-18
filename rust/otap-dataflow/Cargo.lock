@@ -8094,6 +8094,7 @@ dependencies = [
  "bytes",
  "chrono",
  "chrono-tz",
+ "criterion",
  "futures",
  "iana-time-zone",
  "linkme",
