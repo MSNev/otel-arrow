@@ -242,20 +242,16 @@ one exporter instance. Once the limit is reached, partial batches are flushed
 and the exporter stops receiving PData until capacity becomes available.
 `max_in_flight` independently bounds concurrent HTTP requests. Without
 coalescing, it also bounds admitted source messages and completion routes.
-During shutdown, the existing engine inbox can force-drain one input past the
-admission gate. The exporter parks at most one such source, flushes its
-internal batches immediately, and waits for capacity before consuming more
-input. The normal admitted-message bound plus this single parked source
-limits exporter-owned retention; upstream backlog is not copied into a queue.
-The exporter opts into `recv_when_or_shutdown_started()`, which returns a
-one-time notification when shutdown is latched, even if an empty upstream
-remains open. This lets the exporter immediately flush partial batches.
-The receive future stays registered while pending, so late shared-channel
-input and channel closure can wake it. The optional, read-only
-`shutdown_deadline()` accessor exposes the latched deadline so the exporter
-can arm an independent timer. Parked input therefore cannot prevent
-cancellation of stalled requests or completion routes at that deadline.
-Existing inbox receive methods retain their admission and shutdown behavior.
+During shutdown, the engine inbox force-drains buffered input past the
+admission gate. Input received while the exporter has capacity is exported
+normally. Input received without capacity is retryably NACKed with cause
+`node_shutdown`, the same treatment as the OTLP exporters, and its internal
+batches are flushed immediately. The exporter never retains forced input
+while waiting for capacity, so it keeps polling the inbox with the standard
+`recv_when` and relies on the inbox to deliver the final `Shutdown` at the
+original deadline. Shutdown is sent only after receivers have drained, so
+pending NACKs hold data already admitted to the pipeline rather than new
+upstream work.
 
 All bounds are per exporter instance. Process-wide capacity scales with the
 number of pipeline instances.
