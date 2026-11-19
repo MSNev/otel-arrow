@@ -210,17 +210,13 @@ client refusals return permanent NACKs. Setting `max_retries: 0` disables both
 transient HTTP retries and retained 401 retries.
 
 During shutdown, the engine can force-drain input despite the normal admission
-gate. The exporter treats this as a shutdown signal, flushes partial requests
-without waiting for their timers, and parks at most one extra source until
-admitted work releases capacity. It does not accumulate the upstream backlog.
-Sources that cannot be dispatched without credentials receive `node_shutdown`
-NACKs. The exporter observes shutdown latching even when the receive remains
-pending because upstream is empty but still open, so partial requests flush
-without waiting for another input or their timers. It also observes the
-latched deadline while an overflow source is parked. That deadline bounds
-requests, completion routing, and the wait for capacity without requiring
-further inbox polling; unresolved work is canceled and recorded when it expires.
-Closing upstream after shutdown starts does not replace that original deadline.
+gate. The exporter treats this as a shutdown signal and flushes partial
+requests without waiting for their timers. Forced input that arrives while the
+exporter has no capacity receives a retryable `node_shutdown` NACK instead of
+being retained, as do sources that cannot be dispatched without credentials.
+The exporter keeps receiving while it drains, so the engine delivers the final
+shutdown at the original deadline; unresolved requests and completion routes
+are canceled and recorded when it expires.
 
 Non-OTLP inputs use the effect handler's cooperative codec view. The original
 source remains available for completion routing if preparation is canceled.
